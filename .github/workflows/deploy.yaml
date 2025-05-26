@@ -1,0 +1,86 @@
+name: Build and Push Analytics API to ECR
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    env:
+      AWS_REGION: us-east-1
+      ECR_REPOSITORY: analytics-api
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Create ECR repository if not exists
+        run: |
+          aws ecr describe-repositories --repository-names ${{ env.ECR_REPOSITORY }} || \
+          aws ecr create-repository --repository-name ${{ env.ECR_REPOSITORY }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Get commit hash
+        id: get-commit-hash
+        run: echo "COMMIT_HASH=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      - name: Build and push Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          BASE_PATH: /portal
+          DATABASE_TYPE: postgresql
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$COMMIT_HASH \
+            --build-arg BASE_PATH=$BASE_PATH \
+            --build-arg DATABASE_TYPE=$DATABASE_TYPE .
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$COMMIT_HASH $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$COMMIT_HASH
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+      - name: Deploy to EC2 using AWS SSM
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ANALYTICS_DB_URL: ${{ secrets.ANALYTICS_DB_URL }}
+          EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+        run: |
+          aws ssm send-command \
+            --instance-ids $EC2_INSTANCE_ID \
+            --document-name "AWS-RunShellScript" \
+            --parameters commands="
+              # Stop and remove the existing app container
+              docker stop analytics || true
+              docker rm analytics || true
+
+              # Login to ECR
+              aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.ECR_REGISTRY }}
+              
+              # Pull the image with commit hash
+              docker pull ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.COMMIT_HASH }}
+              
+              # Run new container with the specified environment variables
+              docker run -d \
+                --name analytics \
+                --restart unless-stopped \
+                -p 3003:3000 \
+                -e APP_SECRET=\"lyogay\" \
+                -e COLLECT_API_ENDPOINT=\"/connection\" \
+                -e DISABLE_TELEMETRY=1 \
+                -e ENABLE_TEST_CONSOLE=1 \
+                -e TRACKER_SCRIPT_NAME=\"edgeconn\" \
+                -e DATABASE_URL=\"$ANALYTICS_DB_URL\" \
+                ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.COMMIT_HASH }}
+            " \
+            --output text
