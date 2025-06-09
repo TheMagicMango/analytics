@@ -54,10 +54,9 @@ jobs:
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           ANALYTICS_DB_URL: ${{ secrets.ANALYTICS_DB_URL }}
-          EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
         run: |
           aws ssm send-command \
-            --instance-ids $EC2_INSTANCE_ID \
+            --instance-ids i-0e7ae8dd7f8b38564 \
             --document-name "AWS-RunShellScript" \
             --parameters commands="
               # Stop and remove the existing app container
